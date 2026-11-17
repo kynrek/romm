@@ -35,6 +35,31 @@ function windowResponse(total: number | null = 1000, items: unknown[] = []) {
   return { data: { total, items, char_index: {}, rom_id_index: [] } };
 }
 
+// Id n sits at position n - 1, so a window's first id names its offset.
+const IDS = Array.from({ length: 1000 }, (_, i) => i + 1);
+
+async function withIdList() {
+  getRoms.mockResolvedValueOnce({
+    data: { total: IDS.length, items: [], char_index: {}, rom_id_index: IDS },
+  });
+  const store = storeGalleryRoms();
+  await store.fetchInitialMetadata();
+  getRoms.mockClear();
+  return store;
+}
+
+// A window that returns every game it asked for.
+function fullWindow(params: { romIds: number[] }) {
+  return windowResponse(
+    null,
+    params.romIds.map((id) => ({ id })),
+  );
+}
+
+function windowStarts(): number[] {
+  return getRoms.mock.calls.map((c) => c[0].romIds[0]).sort((a, b) => a - b);
+}
+
 describe("galleryRoms windowed fetch", () => {
   beforeEach(() => {
     getRoms.mockReset();
@@ -58,14 +83,13 @@ describe("galleryRoms windowed fetch", () => {
   });
 
   it("collapses many visible positions into one request per 72-item window", async () => {
-    getRoms.mockImplementation(() => Promise.resolve(windowResponse()));
-    const store = storeGalleryRoms();
+    const store = await withIdList();
+    getRoms.mockImplementation((params) => Promise.resolve(fullWindow(params)));
 
-    // Every position falls inside the first 72-item window.
     store.syncVisibleWindows([0, 5, 40, 71]);
 
     expect(getRoms).toHaveBeenCalledTimes(1);
-    expect(getRoms.mock.calls[0]![0].offset).toBe(0);
+    expect(getRoms.mock.calls[0]![0].romIds).toEqual(IDS.slice(0, 72));
 
     // Positions straddling the window boundary hit exactly two windows.
     await flushPromises();
@@ -73,64 +97,56 @@ describe("galleryRoms windowed fetch", () => {
     store.byPosition = new Map();
     store.loadedWindows = new Set();
     store.syncVisibleWindows([70, 72, 100]);
-    const offsets = getRoms.mock.calls
-      .map((c) => c[0].offset)
-      .sort((a, b) => a - b);
-    expect(offsets).toEqual([0, 72]);
+    expect(windowStarts()).toEqual([1, 73]);
 
     await flushPromises();
   });
 
   it("caps concurrent window fetches and drains the queue as slots free up", async () => {
-    const pending = new Map<number, Deferred>();
-    getRoms.mockImplementation((params: { offset: number }) => {
+    const store = await withIdList();
+    const pending = new Map<number, () => void>();
+    getRoms.mockImplementation((params: { romIds: number[] }) => {
       const d = deferred();
-      pending.set(params.offset, d);
+      pending.set(params.romIds[0] ?? 0, () => d.resolve(fullWindow(params)));
       return d.promise;
     });
-    const store = storeGalleryRoms();
 
-    // Six distinct windows want to load at once (0, 72, ..., 360).
     store.syncVisibleWindows([0, 72, 144, 216, 288, 360]);
 
     // Only MAX_CONCURRENT_WINDOWS (4) may be in flight; the rest are parked.
     expect(getRoms).toHaveBeenCalledTimes(4);
 
-    // Resolve the four in-flight windows; each freed slot pulls one from the
-    // queue until all six have run.
-    for (const offset of [0, 72, 144, 216]) {
-      pending.get(offset)?.resolve(windowResponse());
+    for (const start of [1, 73, 145, 217]) {
+      pending.get(start)?.();
     }
     await flushPromises();
 
     expect(getRoms).toHaveBeenCalledTimes(6);
-    const offsets = getRoms.mock.calls
-      .map((c) => c[0].offset)
-      .sort((a, b) => a - b);
-    expect(offsets).toEqual([0, 72, 144, 216, 288, 360]);
+    expect(windowStarts()).toEqual([1, 73, 145, 217, 289, 361]);
   });
 
   it("does not exceed the cap even as queued windows drain", async () => {
     let inFlight = 0;
     let peak = 0;
-    const pending: Deferred[] = [];
-    getRoms.mockImplementation(() => {
+    const pending: (() => void)[] = [];
+    getRoms.mockImplementation((params: { romIds: number[] }) => {
       inFlight++;
       peak = Math.max(peak, inFlight);
       const d = deferred();
-      pending.push(d);
+      pending.push(() => d.resolve(fullWindow(params)));
       return d.promise.finally(() => {
         inFlight--;
       });
     });
-    const store = storeGalleryRoms();
+    const store = await withIdList();
+    getRoms.mockClear();
 
     store.syncVisibleWindows([0, 72, 144, 216, 288, 360, 432, 504]);
 
     // Drain by resolving windows one at a time; the peak in-flight count must
     // never pass the cap of 4.
     while (pending.length > 0) {
-      pending.shift()?.resolve(windowResponse());
+      pending.shift()?.();
       await flushPromises();
     }
 
@@ -239,83 +255,188 @@ describe("galleryRoms windowed fetch", () => {
     expect(galleryFilter.filterTags).toEqual([]);
   });
 
-  it("keeps the bootstrap char_index when the first window skips aggregations", async () => {
-    getRoms.mockImplementation((params: { limit?: number }) => {
-      // The bootstrap (limit 1) carries the char index; the follow-up
-      // window skips it and the backend returns an empty (but truthy) {}.
-      if (params.limit === 1) {
-        return Promise.resolve({
-          data: {
-            total: 500,
-            items: [],
-            char_index: { A: 0, B: 10 },
-            rom_id_index: [1, 2, 3],
-          },
-        });
-      }
-      return Promise.resolve(windowResponse(500));
+  describe("windows by id", () => {
+    const ids = Array.from({ length: 200 }, (_, i) => 1000 + i);
+
+    // The first call is the bootstrap, without its first window, so window 0
+    // still loads by id.
+    function bootstrapThen(window: (params: { romIds?: number[] }) => unknown) {
+      getRoms
+        .mockResolvedValueOnce({
+          data: { total: 200, items: [], char_index: {}, rom_id_index: ids },
+        })
+        .mockImplementation((params: { romIds?: number[] }) =>
+          Promise.resolve(window(params)),
+        );
+    }
+
+    it("asks for its slice of the bootstrap's id list", async () => {
+      // Arrange
+      bootstrapThen(() => windowResponse(null));
+      const store = storeGalleryRoms();
+      await store.fetchInitialMetadata();
+
+      // Act
+      store.syncVisibleWindows([72]);
+      await flushPromises();
+
+      // Assert
+      const windowCall = getRoms.mock.calls.find((c) => c[0].romIds);
+      expect(Object.keys(windowCall?.[0] ?? {}).sort()).toEqual([
+        "romIds",
+        "signal",
+      ]);
+      expect(windowCall?.[0].romIds).toEqual(ids.slice(72, 144));
     });
-    const store = storeGalleryRoms();
 
-    await store.fetchInitialMetadata();
-    expect(store.charIndex).toEqual({ A: 0, B: 10 });
-    expect(store.metadataLoaded).toBe(true);
+    it("waits for the id list, then loads the window by id", async () => {
+      // Arrange
+      const boot = deferred();
+      getRoms
+        .mockImplementationOnce(() => boot.promise)
+        .mockImplementation(() => Promise.resolve(windowResponse(null)));
+      const store = storeGalleryRoms();
 
-    // Window 0 loads with the aggregations skipped; its empty char_index
-    // must not wipe what the bootstrap populated (the AlphaStrip bug).
-    store.syncVisibleWindows([0]);
-    await flushPromises();
-
-    const windowCall = getRoms.mock.calls.find(
-      (c) => c[0].withCharIndex === false,
-    );
-    expect(windowCall).toBeTruthy();
-    // The follow-up window also opts out of the full-library id-index scan
-    // the bootstrap already paid for.
-    expect(windowCall?.[0].withRomIdIndex).toBe(false);
-    expect(store.charIndex).toEqual({ A: 0, B: 10 });
-  });
-
-  // Skipping the id index used to make the backend fall back to a full COUNT,
-  // so every scroll batch re-counted the library for a total the page already
-  // had (issue #4053).
-  it("skips the total on a window the bootstrap already sized", async () => {
-    getRoms.mockImplementation((params: { limit?: number }) => {
-      if (params.limit === 1) {
-        return Promise.resolve({
-          data: { total: 500, items: [], char_index: {}, rom_id_index: [] },
-        });
-      }
-      // The backend returns a null total when the count is skipped.
-      return Promise.resolve({
-        data: { total: null, items: [], char_index: {}, rom_id_index: [] },
+      // Act
+      store.syncVisibleWindows([72]);
+      const callsBeforeIds = getRoms.mock.calls.length;
+      boot.resolve({
+        data: { total: 200, items: [], char_index: {}, rom_id_index: ids },
       });
+      await flushPromises();
+
+      // Assert
+      expect(callsBeforeIds).toBe(1);
+      expect(getRoms.mock.calls[0]![0].romIds).toBeUndefined();
+      expect(getRoms.mock.calls[1]![0].romIds).toEqual(ids.slice(72, 144));
     });
-    const store = storeGalleryRoms();
 
-    await store.fetchInitialMetadata();
-    expect(store.total).toBe(500);
+    // A window short of ids answers by id; the stale-list refresh stays pending.
+    function shortWindows(missing: number[]) {
+      bootstrapThen((params) =>
+        params.romIds
+          ? windowResponse(
+              null,
+              params.romIds
+                .filter((id) => !missing.includes(id))
+                .map((id) => romFixture({ id })),
+            )
+          : deferred().promise,
+      );
+    }
 
-    store.syncVisibleWindows([72]);
-    await flushPromises();
+    it("leaves a gap for an id the backend left out, without shifting the rest", async () => {
+      // Arrange
+      shortWindows([ids[73] ?? 0]);
+      const store = storeGalleryRoms();
+      await store.fetchInitialMetadata();
 
-    const windowCall = getRoms.mock.calls.find((c) => c[0].offset === 72);
-    expect(windowCall?.[0].withTotal).toBe(false);
-    // The null total must not blank the size the bootstrap established.
-    expect(store.total).toBe(500);
-  });
+      // Act
+      store.syncVisibleWindows([72]);
+      await flushPromises();
 
-  // The very first window doubles as the bootstrap when nothing has loaded
-  // yet, so it still has to bring the total back with it.
-  it("asks for the total on the first window when no bootstrap ran", async () => {
-    getRoms.mockResolvedValue(windowResponse(300));
-    const store = storeGalleryRoms();
+      // Assert
+      expect(store.byPosition.get(72)?.id).toBe(ids[72]);
+      expect(store.byPosition.has(73)).toBe(false);
+      expect(store.byPosition.get(74)?.id).toBe(ids[74]);
+    });
 
-    store.syncVisibleWindows([0]);
-    await flushPromises();
+    it("refreshes a stale id list once when a window comes back short", async () => {
+      // Arrange
+      shortWindows([ids[10] ?? 0, ids[80] ?? 0]);
+      const store = storeGalleryRoms();
+      await store.fetchInitialMetadata();
 
-    expect(getRoms.mock.calls[0]![0].withTotal).toBeUndefined();
-    expect(store.total).toBe(300);
+      // Act
+      store.syncVisibleWindows([0, 72]);
+      await flushPromises();
+
+      // Assert
+      const afterBootstrap = getRoms.mock.calls.slice(1);
+      expect(afterBootstrap.filter((c) => !c[0].romIds)).toHaveLength(1);
+      expect(store.refreshing).toBe(true);
+    });
+
+    it("places the bootstrap's first window and doesn't fetch it again", async () => {
+      // Arrange
+      getRoms.mockResolvedValueOnce({
+        data: {
+          total: 200,
+          items: ids.slice(0, 72).map((id) => romFixture({ id })),
+          char_index: {},
+          rom_id_index: ids,
+        },
+      });
+      const store = storeGalleryRoms();
+
+      // Act
+      await store.fetchInitialMetadata();
+      store.syncVisibleWindows([0, 40]);
+      await flushPromises();
+
+      // Assert
+      expect(getRoms).toHaveBeenCalledTimes(1);
+      expect(getRoms.mock.calls[0]![0].limit).toBe(72);
+      expect(store.byPosition.get(40)?.id).toBe(ids[40]);
+      expect(store.loadedWindows.has(0)).toBe(true);
+    });
+
+    it("doesn't refetch the first window while it's still being placed", async () => {
+      // Arrange
+      const frames: FrameRequestCallback[] = [];
+      vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+        frames.push(cb);
+        return frames.length;
+      });
+      getRoms.mockResolvedValueOnce({
+        data: {
+          total: 200,
+          items: ids.slice(0, 72).map((id) => romFixture({ id })),
+          char_index: {},
+          rom_id_index: ids,
+        },
+      });
+      const store = storeGalleryRoms();
+      const booting = store.fetchInitialMetadata();
+      await flushPromises();
+
+      // Act
+      store.syncVisibleWindows([0]);
+      while (frames.length > 0) {
+        frames.shift()?.(0);
+        await flushPromises();
+      }
+      await booting;
+
+      // Assert
+      expect(getRoms).toHaveBeenCalledTimes(1);
+      expect(store.loadedWindows.has(0)).toBe(true);
+    });
+
+    it("lets a second caller wait for the bootstrap in flight", async () => {
+      // Arrange
+      const boot = deferred();
+      getRoms.mockImplementationOnce(() => boot.promise);
+      const store = storeGalleryRoms();
+      const first = store.fetchInitialMetadata();
+
+      // Act
+      let secondDone = false;
+      const second = store.fetchInitialMetadata().then(() => {
+        secondDone = true;
+      });
+      await flushPromises();
+      const doneBeforeData = secondDone;
+      boot.resolve({
+        data: { total: 200, items: [], char_index: {}, rom_id_index: ids },
+      });
+      await Promise.all([first, second]);
+
+      // Assert
+      expect(getRoms).toHaveBeenCalledTimes(1);
+      expect(doneBeforeData).toBe(false);
+      expect(store.metadataLoaded).toBe(true);
+    });
   });
 
   it("does not mark a window loaded when the context is invalidated mid-apply", async () => {
@@ -327,18 +448,18 @@ describe("galleryRoms windowed fetch", () => {
       return frames.length;
     });
 
+    const store = await withIdList();
     const first = deferred();
     getRoms.mockImplementation(() => first.promise);
-    const store = storeGalleryRoms();
 
     store.syncVisibleWindows([0]);
     expect(getRoms).toHaveBeenCalledTimes(1);
 
     // More than one apply batch (APPLY_BATCH_SIZE = 8) so the apply parks on
     // a frame partway through.
-    const items = Array.from({ length: 16 }, (_, i) => ({ id: i }));
+    const items = IDS.slice(0, 16).map((id) => ({ id }));
     first.resolve({
-      data: { total: 1000, items, char_index: {}, rom_id_index: [] },
+      data: { total: null, items, char_index: {}, rom_id_index: [] },
     });
     await flushPromises();
     expect(frames.length).toBeGreaterThan(0);
@@ -485,6 +606,7 @@ describe("galleryRoms refresh", () => {
     store.syncVisibleWindows([0]);
     seedOldResult(store);
     store.total = 200;
+    store.romIdIndex = IDS.slice(0, 200);
     getRoms.mockClear();
 
     filter.searchTerm = "zelda";
@@ -493,8 +615,7 @@ describe("galleryRoms refresh", () => {
 
     const [refresh, window] = getRoms.mock.calls.map((c) => c[0]);
     expect(refresh.searchTerm).toBe("zelda");
-    expect(window.searchTerm).toBe("mario");
-    expect(window.offset).toBe(72);
+    expect(window.romIds).toEqual(IDS.slice(72, 144));
   });
 
   it("keeps the displayed id list while refreshing", () => {
@@ -517,6 +638,7 @@ describe("galleryRoms refresh", () => {
     const store = storeGalleryRoms();
     seedOldResult(store);
     store.total = 200;
+    store.romIdIndex = IDS.slice(0, 200);
 
     const done = store.refreshResults();
     store.syncVisibleWindows([100]);

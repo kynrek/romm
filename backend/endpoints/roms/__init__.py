@@ -651,6 +651,9 @@ class CustomLimitOffsetPage[T: BaseModel](LimitOffsetPage[T]):
     filter_values: RomFiltersDict
 
 
+# The most roms one `rom_ids` window may name.
+ROM_IDS_WINDOW_MAX: Final = 256
+
 # Month 1-12 and day 1-31, so a match is already a calendar day.
 RELEASED_DAY_REGEX = re.compile(r"^(0?[1-9]|1[0-2])-(0?[1-9]|[12]\d|3[01])$")
 
@@ -775,9 +778,26 @@ def get_roms(
         bool,
         Query(description="Whether to include each rom's file entries."),
     ] = False,
+    rom_ids: Annotated[
+        list[Annotated[int, Field(ge=1)]] | None,
+        Query(
+            description=(
+                "Load exactly these roms, in this order, instead of ranking a page:"
+                " a window the caller sliced from `rom_id_index`. Repeat the"
+                f" parameter, 1 to {ROM_IDS_WINDOW_MAX} positive ids. Ids the caller"
+                " can't see, or that no longer exist, are left out. The sidecars and"
+                " the total are skipped, and `offset` and `limit` are ignored."
+            ),
+            min_length=1,
+            max_length=ROM_IDS_WINDOW_MAX,
+        ),
+    ] = None,
 ) -> CustomLimitOffsetPage[SimpleRomSchema]:
     """Retrieve roms."""
     perms = get_permissions(request)
+    if rom_ids is not None:
+        # The caller already holds the ordered list, so nothing spans the set.
+        with_char_index = with_filter_values = with_rom_id_index = with_total = False
     parsed_released_days = parse_released_days(released_days)
 
     # Normalised once so the query layer and every cache key agree on case.
@@ -943,7 +963,9 @@ def get_roms(
                 else None
             )
 
-        if with_rom_id_index:
+        if rom_ids is not None:
+            page_ids = list(rom_ids)
+        elif with_rom_id_index:
             page_ids = list(rom_id_index[params.offset : params.offset + params.limit])
         else:
             # Ordering the entity itself carries every JSON metadata blob
